@@ -978,6 +978,10 @@ a740_raw_magic_regs = [
     ]
 
 
+# A710/A720 reuse A730 magic regs for now (no upstream support)
+a710_raw_magic_regs = list(a730_raw_magic_regs)
+a720_raw_magic_regs = list(a730_raw_magic_regs)
+
 # Adreno 710/720 are not supported by the upstream, but some hacks float on the internet adding their support.
 # These hacks simply reuse A730 entry with different ids and looks like it works in some extent
 # Let's do the same in our patchset
