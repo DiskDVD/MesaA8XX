@@ -450,7 +450,6 @@ ir3_get_non_alu_delay(struct ir3_compiler *compiler)
 
 ENDC;
 
-<<<<<<< HEAD
 #ifdef __cplusplus
 struct ir3_blob_write : mesa::blob_write {
    using mesa::blob_write::blob_write;
@@ -471,6 +470,3 @@ struct ir3_blob_read : mesa::blob_read {
 #endif /* __cplusplus */
 
 #endif /* IR3_COMPILER_H_ */
-=======
-#endif /* IR3_COMPILER_H_ */
->>>>>>> old-repo/A8XX-old
