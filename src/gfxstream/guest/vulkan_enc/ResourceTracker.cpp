@@ -751,14 +751,15 @@ CoherentMemoryPtr ResourceTracker::freeCoherentMemoryLocked(VkDeviceMemory memor
                                                             VkDeviceMemory_Info& info) {
     VK_FROM_HANDLE(gfxstream_vk_device_memory, gfxstream_memory, memory);
 
-    if (info.coherentMemory && gfxstream_memory->mapped) {
-        gfxstream_memory->mapped = nullptr;
+    if (info.coherentMemory) {
+        if (gfxstream_memory->mapped) {
+            info.coherentMemory->release(info.coherentMemoryOffset);
+            gfxstream_memory->mapped = nullptr;
+        }
 
         if (info.coherentMemory->getDeviceMemory() != memory) {
             delete_gfxstream_vk_device_memory(memory);
         }
-
-        info.coherentMemory->release(info.coherentMemoryOffset);
 
         return std::move(info.coherentMemory);
     }
@@ -1395,6 +1396,9 @@ void ResourceTracker::transformImpl_VkExternalMemoryProperties_fromhost(
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
     supportedHandleType |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 #endif  // VK_USE_PLATFORM_ANDROID_KHR
+#ifdef LINUX_GUEST_BUILD
+    supportedHandleType |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+#endif  // LINUX_GUEST_BUILD
     if (supportedHandleType) {
         pProperties->compatibleHandleTypes &= supportedHandleType;
         pProperties->exportFromImportedHandleTypes &= supportedHandleType;
@@ -1878,6 +1882,11 @@ VkResult ResourceTracker::on_vkEnumerateDeviceExtensionProperties(
         "VK_EXT_image_drm_format_modifier",
         "VK_KHR_external_memory_fd",
         "VK_EXT_robustness2",
+        "VK_EXT_fragment_density_map",
+        "VK_EXT_graphics_pipeline_library",
+        "VK_EXT_image_compression_control",
+        "VK_EXT_image_compression_control_swapchain",
+        "VK_KHR_pipeline_library",
 #endif
         // Vulkan 1.1
         "VK_KHR_16bit_storage",
@@ -2258,6 +2267,8 @@ void ResourceTracker::on_vkGetPhysicalDeviceProperties2(void* context,
         pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT);
     auto* pciProps = vk_extract_struct<VkPhysicalDevicePCIBusInfoPropertiesEXT>(
         pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT);
+    auto* layeredPropsList = vk_extract_struct<VkPhysicalDeviceLayeredApiPropertiesListKHR>(
+        pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_API_PROPERTIES_LIST_KHR);
 #if defined(VK_USE_PLATFORM_ANDROID_KHR)
     auto* presentationProps = vk_extract_struct<VkPhysicalDevicePresentationPropertiesANDROID>(
         pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENTATION_PROPERTIES_ANDROID);
@@ -2273,11 +2284,37 @@ void ResourceTracker::on_vkGetPhysicalDeviceProperties2(void* context,
         __vk_append_struct(pProperties, &driverPropsLocal);
     }
 
+    VkPhysicalDeviceLayeredApiVulkanPropertiesKHR* layeredVkProps =
+        (layeredPropsList && layeredPropsList->pLayeredApis &&
+         layeredPropsList->layeredApiCount > 0)
+            ? vk_find_struct(&layeredPropsList->pLayeredApis[0],
+                             PHYSICAL_DEVICE_LAYERED_API_VULKAN_PROPERTIES_KHR)
+            : nullptr;
+    VkPhysicalDeviceIDProperties* layeredIdProps =
+        layeredVkProps ? vk_find_struct(&layeredVkProps->properties, PHYSICAL_DEVICE_ID_PROPERTIES)
+                       : nullptr;
+
+    VkPhysicalDeviceIDProperties idPropsLocal = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceVulkan11Properties* hostVk11Props =
+        vk_find_struct(pProperties, PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES);
+    VkPhysicalDeviceIDProperties* hostIdProps =
+        vk_find_struct(pProperties, PHYSICAL_DEVICE_ID_PROPERTIES);
+    if (layeredIdProps && !hostIdProps && !hostVk11Props) {
+        hostIdProps = &idPropsLocal;
+        __vk_append_struct(pProperties, &idPropsLocal);
+    }
+
     enc->vkGetPhysicalDeviceProperties2(physicalDevice, pProperties, false /* no lock */);
 
-    // Filter driver properties from the pNext chain if it was appended locally
+    // Extract driver and ID properties from the pNext chain if appended locally
     if (hostDriverProps == &driverPropsLocal) {
-        vk_filter_struct(pProperties, PHYSICAL_DEVICE_DRIVER_PROPERTIES);
+        vk_extract_struct<VkPhysicalDeviceDriverProperties>(
+            pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES);
+    }
+    if (hostIdProps == &idPropsLocal) {
+        vk_extract_struct<VkPhysicalDeviceIDProperties>(
+            pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES);
     }
 
     // Re-append extracted guest-only structures
@@ -2287,11 +2324,63 @@ void ResourceTracker::on_vkGetPhysicalDeviceProperties2(void* context,
     if (pciProps) {
         __vk_append_struct(pProperties, pciProps);
     }
+    if (layeredPropsList) {
+        __vk_append_struct(pProperties, layeredPropsList);
+    }
 #if defined(VK_USE_PLATFORM_ANDROID_KHR)
     if (presentationProps) {
         __vk_append_struct(pProperties, presentationProps);
     }
 #endif
+
+    // Must populate before top-level pProperties and pNext structs are overwritten below.
+    if (layeredPropsList) {
+        if (!layeredPropsList->pLayeredApis) {
+            layeredPropsList->layeredApiCount = 1;
+        } else if (layeredPropsList->layeredApiCount > 0) {
+            layeredPropsList->layeredApiCount = 1;
+            VkPhysicalDeviceLayeredApiPropertiesKHR* layeredApiProps =
+                &layeredPropsList->pLayeredApis[0];
+            layeredApiProps->vendorID = pProperties->properties.vendorID;
+            layeredApiProps->deviceID = pProperties->properties.deviceID;
+            layeredApiProps->layeredAPI = VK_PHYSICAL_DEVICE_LAYERED_API_VULKAN_KHR;
+            memcpy(layeredApiProps->deviceName, pProperties->properties.deviceName,
+                   sizeof(layeredApiProps->deviceName));
+
+            if (layeredVkProps) {
+                layeredVkProps->properties.properties = pProperties->properties;
+                memset(&layeredVkProps->properties.properties.limits, 0,
+                       sizeof(layeredVkProps->properties.properties.limits));
+                memset(&layeredVkProps->properties.properties.sparseProperties, 0,
+                       sizeof(layeredVkProps->properties.properties.sparseProperties));
+
+                if (auto* layeredDriverProps = vk_find_struct(&layeredVkProps->properties,
+                                                              PHYSICAL_DEVICE_DRIVER_PROPERTIES)) {
+                    layeredDriverProps->driverID = hostDriverProps->driverID;
+                    memcpy(layeredDriverProps->driverName, hostDriverProps->driverName,
+                           sizeof(layeredDriverProps->driverName));
+                    memcpy(layeredDriverProps->driverInfo, hostDriverProps->driverInfo,
+                           sizeof(layeredDriverProps->driverInfo));
+                    layeredDriverProps->conformanceVersion = hostDriverProps->conformanceVersion;
+                }
+
+                if (layeredIdProps) {
+                    auto copy_id_props = [](auto* dst, const auto* src) {
+                        memcpy(dst->deviceUUID, src->deviceUUID, sizeof(dst->deviceUUID));
+                        memcpy(dst->driverUUID, src->driverUUID, sizeof(dst->driverUUID));
+                        memcpy(dst->deviceLUID, src->deviceLUID, sizeof(dst->deviceLUID));
+                        dst->deviceNodeMask = src->deviceNodeMask;
+                        dst->deviceLUIDValid = src->deviceLUIDValid;
+                    };
+                    if (hostIdProps) {
+                        copy_id_props(layeredIdProps, hostIdProps);
+                    } else if (hostVk11Props) {
+                        copy_id_props(layeredIdProps, hostVk11Props);
+                    }
+                }
+            }
+        }
+    }
 
     // Overwrite device type and driver properties
     pProperties->properties.deviceType = VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU;
@@ -3210,8 +3299,20 @@ static uint32_t getVirglFormat(VkFormat vkFormat) {
 
 CoherentMemoryPtr ResourceTracker::createCoherentMemory(
     VkDevice device, VkDeviceMemory mem, const VkMemoryAllocateInfo& hostAllocationInfo,
-    VkEncoder* enc, VkResult& res) {
+    const VirtGpuResourcePtr& guestBlob, VkEncoder* enc, VkResult& res) {
     CoherentMemoryPtr coherentMemory = nullptr;
+
+    if (guestBlob) {
+        auto mapping = guestBlob->createMapping();
+        if (!mapping) {
+            mesa_loge("Failed to create coherent memory: failed to create blob mapping.");
+            res = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            return coherentMemory;
+        }
+
+        return std::make_shared<CoherentMemory>(mapping, hostAllocationInfo.allocationSize, device,
+                                                mem);
+    }
 
 #if DETECT_OS_ANDROID
     if (mFeatureInfo.hasDirectMem) {
@@ -3393,29 +3494,10 @@ VkResult ResourceTracker::allocateCoherentMemory(VkDevice device,
         return host_res;
     }
     VK_FROM_HANDLE(gfxstream_vk_device_memory, gfxstream_memory, mem);
+    gfxstream_memory->mapped_size = pAllocateInfo->allocationSize;
 
     struct VkDeviceMemory_Info info;
-    if (mCaps.vulkanCapset.deferredMapping || mCaps.params[kParamCreateGuestHandle]) {
-        gfxstream_memory->mapped_size = pAllocateInfo->allocationSize;
-        info.blobId = createBlobInfo.blobId;
-    }
-
-    if (guestBlob) {
-        auto mapping = guestBlob->createMapping();
-        if (!mapping) {
-            mesa_loge("Failed to allocate coherent memory: failed to create blob mapping.");
-            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-        }
-
-        auto coherentMemory = std::make_shared<CoherentMemory>(
-            mapping, hostAllocationInfo.allocationSize, device, mem);
-
-        coherentMemory->subAllocate(pAllocateInfo->allocationSize, &ptr, offset);
-        info.coherentMemoryOffset = offset;
-        info.coherentMemory = coherentMemory;
-        gfxstream_memory->mapped = ptr;
-    }
-
+    info.blobId = createBlobInfo.blobId;
     info.coherentMemorySize = hostAllocationInfo.allocationSize;
     info.memoryTypeIndex = hostAllocationInfo.memoryTypeIndex;
     info.device = device;
@@ -3427,27 +3509,41 @@ VkResult ResourceTracker::allocateCoherentMemory(VkDevice device,
         info_VkDeviceMemory[mem] = info;
     }
 
-    if (mCaps.vulkanCapset.deferredMapping || mCaps.params[kParamCreateGuestHandle]) {
+    // With deferred mapping, the coherent memory is created on the first vkMapMemory().
+    if (mCaps.vulkanCapset.deferredMapping && !mCaps.params[kParamCreateGuestHandle]) {
         *pMemory = mem;
+        return VK_SUCCESS;
+    }
+
+    auto coherentMemory =
+        createCoherentMemory(device, mem, hostAllocationInfo, guestBlob, enc, host_res);
+    if (!coherentMemory) {
+        // Also removes |mem| from info_VkDeviceMemory.
+        enc->vkFreeMemory(device, mem, nullptr, true /* do lock */);
         return host_res;
     }
 
-    auto coherentMemory = createCoherentMemory(device, mem, hostAllocationInfo, enc, host_res);
-    if (coherentMemory) {
-        std::lock_guard<std::recursive_mutex> lock(mLock);
-        coherentMemory->subAllocate(pAllocateInfo->allocationSize, &ptr, offset);
-        gfxstream_memory->mapped_size = pAllocateInfo->allocationSize;
-        info.coherentMemoryOffset = offset;
-        info.coherentMemory = coherentMemory;
-        gfxstream_memory->mapped = ptr;
-        info_VkDeviceMemory[mem] = info;
-        *pMemory = mem;
-    } else {
-        enc->vkFreeMemory(device, mem, nullptr, true);
-        std::lock_guard<std::recursive_mutex> lock(mLock);
-        info_VkDeviceMemory.erase(mem);
+    if (!coherentMemory->subAllocate(pAllocateInfo->allocationSize, &ptr, offset)) {
+        mesa_loge(
+            "Failed to allocate coherent memory: failed to sub-allocate %llu bytes from %llu-byte "
+            "block.",
+            static_cast<unsigned long long>(pAllocateInfo->allocationSize),
+            static_cast<unsigned long long>(hostAllocationInfo.allocationSize));
+        // |coherentMemory| owns |mem|: destroying it on return frees |mem| on the host and
+        // removes it from info_VkDeviceMemory (see ~CoherentMemory()).
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
-    return host_res;
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(mLock);
+        auto& memInfo = info_VkDeviceMemory[mem];
+        memInfo.coherentMemoryOffset = offset;
+        memInfo.coherentMemory = coherentMemory;
+        gfxstream_memory->mapped = ptr;
+    }
+
+    *pMemory = mem;
+    return VK_SUCCESS;
 }
 
 VkResult ResourceTracker::getCoherentMemory(const VkMemoryAllocateInfo* pAllocateInfo,
@@ -3511,16 +3607,16 @@ VkResult ResourceTracker::on_vkAllocateMemory(void* context, VkResult input_resu
                                               const VkMemoryAllocateInfo* pAllocateInfo,
                                               const VkAllocationCallbacks* pAllocator,
                                               VkDeviceMemory* pMemory) {
-#define _RETURN_FAILURE_WITH_DEVICE_MEMORY_REPORT(result)                                      \
-    {                                                                                          \
-        auto it = info_VkDevice.find(device);                                                  \
-        if (it == info_VkDevice.end()) return result;                                          \
-        mesa_logw("%s:%d: Allocation failure %d", __func__, __LINE__, result);                 \
-        emitDeviceMemoryReport(                                                                \
-            it->second, VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_ALLOCATION_FAILED_EXT, 0,           \
-            pAllocateInfo->allocationSize, VK_OBJECT_TYPE_DEVICE_MEMORY, 0,                    \
-            it->second.memProps.memoryTypes[pAllocateInfo->memoryTypeIndex].heapIndex);        \
-        return result;                                                                         \
+#define _RETURN_FAILURE_WITH_DEVICE_MEMORY_REPORT(result)                               \
+    {                                                                                   \
+        auto it = info_VkDevice.find(device);                                           \
+        if (it == info_VkDevice.end()) return result;                                   \
+        mesa_logw("%s:%d: Allocation failure %d", __func__, __LINE__, result);          \
+        emitDeviceMemoryReport(                                                         \
+            it->second, VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_ALLOCATION_FAILED_EXT, 0,    \
+            pAllocateInfo->allocationSize, VK_OBJECT_TYPE_DEVICE_MEMORY, 0,             \
+            it->second.memProps.memoryTypes[pAllocateInfo->memoryTypeIndex].heapIndex); \
+        return result;                                                                  \
     }
 
     if (input_result != VK_SUCCESS) _RETURN_FAILURE_WITH_DEVICE_MEMORY_REPORT(input_result);
@@ -4026,10 +4122,8 @@ VkResult ResourceTracker::on_vkAllocateMemory(void* context, VkResult input_resu
     VirtGpuResourcePtr bufferBlob = nullptr;
     int importedFd = -1;
 #if defined(LINUX_GUEST_BUILD)
-    hasDedicatedImage =
-        dedicatedAllocInfoPtr && (dedicatedAllocInfoPtr->image != VK_NULL_HANDLE);
-    hasDedicatedBuffer =
-        dedicatedAllocInfoPtr && (dedicatedAllocInfoPtr->buffer != VK_NULL_HANDLE);
+    hasDedicatedImage = dedicatedAllocInfoPtr && (dedicatedAllocInfoPtr->image != VK_NULL_HANDLE);
+    hasDedicatedBuffer = dedicatedAllocInfoPtr && (dedicatedAllocInfoPtr->buffer != VK_NULL_HANDLE);
 
     // Check for import first; this takes precedence over exportDmabuf in creating the
     // VirtGpuResource
@@ -4344,10 +4438,9 @@ void ResourceTracker::on_vkFreeMemory(void* context, VkDevice device, VkDeviceMe
 
 #ifdef VK_USE_PLATFORM_FUCHSIA
     if (info.vmoHandle && gfxstream_memory->mapped) {
-        zx_status_t status =
-            zx_vmar_unmap(zx_vmar_root_self(),
-                          reinterpret_cast<zx_paddr_t>(gfxstream_memory->mapped),
-                          gfxstream_memory->mapped_size);
+        zx_status_t status = zx_vmar_unmap(zx_vmar_root_self(),
+                                           reinterpret_cast<zx_paddr_t>(gfxstream_memory->mapped),
+                                           gfxstream_memory->mapped_size);
         if (status != ZX_OK) {
             mesa_loge("%s: Cannot unmap ptr: status %d", __func__, status);
         }
@@ -4429,12 +4522,21 @@ VkResult ResourceTracker::on_vkMapMemory(void* context, VkResult host_result, Vk
         auto coherentMemory =
             std::make_shared<CoherentMemory>(mapping, createBlob.size, device, memory);
 
-        uint8_t* ptr;
-        uint64_t offset;
-        coherentMemory->subAllocate(gfxstream_memory->mapped_size, &ptr, offset);
-
-        deviceMemoryInfo.coherentMemoryOffset = offset;
+        // |coherentMemory| owns |memory| and frees it on destruction, so keep it even if the
+        // sub-allocation fails; it is released when the application frees |memory|.
         deviceMemoryInfo.coherentMemory = coherentMemory;
+
+        uint8_t* ptr = nullptr;
+        uint64_t coherentMemoryOffset = 0;
+        if (!coherentMemory->subAllocate(gfxstream_memory->mapped_size, &ptr,
+                                         coherentMemoryOffset)) {
+            mesa_loge("%s: Failed to sub-allocate %llu bytes from %llu-byte coherent memory block.",
+                      __func__, static_cast<unsigned long long>(gfxstream_memory->mapped_size),
+                      static_cast<unsigned long long>(createBlob.size));
+            return VK_ERROR_MEMORY_MAP_FAILED;
+        }
+
+        deviceMemoryInfo.coherentMemoryOffset = coherentMemoryOffset;
         gfxstream_memory->mapped = ptr;
     }
 
@@ -4449,8 +4551,8 @@ VkResult ResourceTracker::on_vkMapMemory(void* context, VkResult host_result, Vk
         mesa_loge(
             "%s: size is too big. alloc size 0x%llx while we wanted offset 0x%llx size 0x%llx "
             "total 0x%llx",
-            __func__, (unsigned long long)gfxstream_memory->mapped_size,
-            (unsigned long long)offset, (unsigned long long)size, (unsigned long long)offset);
+            __func__, (unsigned long long)gfxstream_memory->mapped_size, (unsigned long long)offset,
+            (unsigned long long)size, (unsigned long long)offset);
         return VK_ERROR_MEMORY_MAP_FAILED;
     }
 
@@ -6295,8 +6397,7 @@ VkResult ResourceTracker::on_vkGetMemoryFdKHR(void* context, VkResult, VkDevice 
     if (!pGetFdInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
     if (!pGetFdInfo->memory) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-    if (!(pGetFdInfo->handleType & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
-                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))) {
+    if (!(pGetFdInfo->handleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) {
         mesa_loge("%s: Export operation not defined for handleType: 0x%x\n", __func__,
                   pGetFdInfo->handleType);
         return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -6986,7 +7087,10 @@ VkResult ResourceTracker::on_vkMapMemoryIntoAddressSpaceGOOGLE_pre(void*, VkResu
     auto& memInfo = it->second;
 
     GoldfishAddressSpaceBlockPtr block = std::make_shared<GoldfishAddressSpaceBlock>();
-    block->allocate(mGoldfishAddressSpaceBlockProvider.get(), memInfo.coherentMemorySize);
+    if (!block->allocate(mGoldfishAddressSpaceBlockProvider.get(), memInfo.coherentMemorySize)) {
+        *pAddress = 0;
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
 
     memInfo.goldfishBlock = block;
     *pAddress = block->physAddr();
@@ -7685,6 +7789,9 @@ VkResult ResourceTracker::on_vkGetPhysicalDeviceImageFormatProperties2(
         vk_find_struct(pImageFormatProperties, ANDROID_HARDWARE_BUFFER_USAGE_ANDROID);
     supportedHandleType |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 #endif
+#ifdef LINUX_GUEST_BUILD
+    supportedHandleType |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+#endif
     const VkPhysicalDeviceExternalImageFormatInfo* ext_img_info =
         vk_find_struct_const(pImageFormatInfo, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
     if (supportedHandleType && ext_img_info) {
@@ -7804,10 +7911,17 @@ void ResourceTracker::on_vkGetPhysicalDeviceExternalBufferProperties(
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
     supportedHandleType |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 #endif
+#ifdef LINUX_GUEST_BUILD
+    supportedHandleType |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+#endif
     if (supportedHandleType) {
         // 0 is a valid handleType so we can't check against 0
         if (pExternalBufferInfo->handleType !=
             (pExternalBufferInfo->handleType & supportedHandleType)) {
+            pExternalBufferProperties->externalMemoryProperties.externalMemoryFeatures = 0;
+            pExternalBufferProperties->externalMemoryProperties.exportFromImportedHandleTypes = 0;
+            pExternalBufferProperties->externalMemoryProperties.compatibleHandleTypes =
+                pExternalBufferInfo->handleType;
             return;
         }
     }
@@ -8335,6 +8449,10 @@ VkResult ResourceTracker::on_vkCreateGraphicsPipelines(
     std::vector<VkGraphicsPipelineCreateInfo> localCreateInfos(pCreateInfos,
                                                                pCreateInfos + createInfoCount);
     for (VkGraphicsPipelineCreateInfo& graphicsPipelineCreateInfo : localCreateInfos) {
+        const bool isPipelineLibrary =
+            (graphicsPipelineCreateInfo.flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) != 0 ||
+            vk_find_struct_const(&graphicsPipelineCreateInfo,
+                                 GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT) != nullptr;
         // dEQP-VK.api.pipeline.pipeline_invalid_pointers_unused_structs#graphics
         bool requireViewportState = false;
         // VUID-VkGraphicsPipelineCreateInfo-rasterizerDiscardEnable-00750
@@ -8343,7 +8461,8 @@ VkResult ResourceTracker::on_vkCreateGraphicsPipelines(
             graphicsPipelineCreateInfo.pRasterizationState->rasterizerDiscardEnable == VK_FALSE;
         // VUID-VkGraphicsPipelineCreateInfo-pViewportState-04892
 #ifdef VK_EXT_extended_dynamic_state2
-        if (!requireViewportState && graphicsPipelineCreateInfo.pDynamicState) {
+        if (!requireViewportState && graphicsPipelineCreateInfo.pRasterizationState != nullptr &&
+            graphicsPipelineCreateInfo.pDynamicState) {
             for (uint32_t i = 0; i < graphicsPipelineCreateInfo.pDynamicState->dynamicStateCount;
                  i++) {
                 if (VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE_EXT ==
@@ -8358,8 +8477,10 @@ VkResult ResourceTracker::on_vkCreateGraphicsPipelines(
             graphicsPipelineCreateInfo.pViewportState = nullptr;
         }
 
-        // It has the same requirement as for pViewportState.
-        bool shouldIncludeFragmentShaderState = requireViewportState;
+        // Partial pipeline libraries without pre-rasterization state have pRasterizationState == nullptr
+        // but may still include fragment shader or fragment output state.
+        bool shouldIncludeFragmentShaderState =
+            (graphicsPipelineCreateInfo.pRasterizationState == nullptr) || requireViewportState;
 
         // VUID-VkGraphicsPipelineCreateInfo-rasterizerDiscardEnable-00751
         if (!shouldIncludeFragmentShaderState) {
@@ -8382,7 +8503,7 @@ VkResult ResourceTracker::on_vkCreateGraphicsPipelines(
 
         // VUID-VkGraphicsPipelineCreateInfo-renderPass-06043
         // VUID-VkGraphicsPipelineCreateInfo-renderPass-06044
-        if (graphicsPipelineCreateInfo.renderPass == VK_NULL_HANDLE ||
+        if ((!isPipelineLibrary && graphicsPipelineCreateInfo.renderPass == VK_NULL_HANDLE) ||
             !shouldIncludeFragmentShaderState) {
             // VUID-VkGraphicsPipelineCreateInfo-renderPass-06053
             if (!forceDepthStencilState) {
@@ -8540,7 +8661,6 @@ const VkPhysicalDeviceMemoryProperties& ResourceTracker::getPhysicalDeviceMemory
     }
     return *mCachedPhysicalDeviceMemoryProps;
 }
-
 
 ResourceTracker::ResourceTracker() {}
 

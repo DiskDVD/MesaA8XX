@@ -50,10 +50,7 @@
 #include "wsi_common.h"
 #endif
 
-#include "git_sha1.h"
-#include "tu_version.h"
-
-#if DETECT_OS_ANDROID
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
 #include <vndk/hardware_buffer.h>
 #endif
 
@@ -3794,7 +3791,7 @@ tu_AllocateMemory(VkDevice _device,
          close(fd_info->fd);
       }
    } else if (mem->vk.ahardware_buffer) {
-#if DETECT_OS_ANDROID
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
       const native_handle_t *handle = AHardwareBuffer_getNativeHandle(mem->vk.ahardware_buffer);
       assert(handle->numFds > 0);
       size_t size = lseek(handle->data[0], 0, SEEK_END);

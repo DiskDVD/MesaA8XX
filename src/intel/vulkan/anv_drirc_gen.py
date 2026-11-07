@@ -81,6 +81,9 @@ def declare_options(android_version):
         B("anv_emulate_divergent_barriers", False,
           "Temporary workaround for a broken shader in some recent RE engine games",
           c_name="emulate_divergent_barriers"),
+        B("anv_force_exact_glsl_fma", False,
+          "Disallow contract/reassociation for GLSLstd450Fma.",
+          c_name="force_exact_glsl_fma"),
 
         # Workaround various driver
         B("always_flush_cache", False,
@@ -234,7 +237,13 @@ def declare_options(android_version):
         B("force_guc_low_latency", False,
           "Enable low latency GuC strategy.",
           c_name="guc_low_latency"),
-
+        E("anv_sample_d_performance", 0, 0, 3,
+          [EV(0, "Disable_sample_d_optimization"),
+           EV(1, "sample_d_ignore12b"),
+           EV(2, "sample_d_ignore16b"),
+           EV(3, "sample_d_ignore20b")],
+          "SAMPLER_STATE::anv_sample_d_performance",
+          c_name="sample_d_performance"),
         E("anv_stack_ids", 512, 256, 2048,
           [EV(256,  "256 stackids"),
            EV(512,  "512 stackids"),
