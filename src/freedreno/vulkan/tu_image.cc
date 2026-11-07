@@ -365,7 +365,7 @@ ubwc_possible(struct tu_device *device,
        vk_format_get_plane_count(format) == 1)
       return false;
 
-   if (type == VK_IMAGE_TYPE_3D && mip_levels > 1) {
+   if (type == VK_IMAGE_TYPE_3D && mip_levels > 1 && info->chip < 8) {
       if (device) {
          perf_debug(
             device,
@@ -695,6 +695,28 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       ubwc_enabled = false;
    }
 
+   /* A810 sampled-depth UBWC diagnostic (opt-in).
+    * Preserve explicit external modifiers, color UBWC and other GPUs.
+    */
+   static const bool a810_sampled_depth_diag = []() {
+      const char *env = os_get_option("TU_A810_SAMPLED_DEPTH_DIAG");
+      return env && strcmp(env, "1") == 0;
+   }();
+
+   const uint64_t sampled_depth_chip = device->physical_device->dev_id.chip_id;
+   const bool sampled_depth_a810 =
+      sampled_depth_chip == 0x44010000ull ||
+      sampled_depth_chip == 0xffff44010000ull;
+
+   const bool sampled_depth =
+      vk_format_is_depth_or_stencil(image->vk.format) &&
+      (pCreateInfo->usage &
+       (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT));
+
+   if (sampled_depth_a810 && a810_sampled_depth_diag &&
+       modifier == DRM_FORMAT_MOD_INVALID && sampled_depth)
+      ubwc_enabled = false;
+
    if (TU_DEBUG(NOUBWC)) {
       ubwc_enabled = false;
    }
@@ -798,6 +820,20 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
          .sparse = image->vk.create_flags &
             VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT,
          .force_disable_linear_fallback = force_disable_linear_fallback,
+         .usage =
+            COND(image->vk.usage &
+                    (VK_IMAGE_USAGE_SAMPLED_BIT |
+                     VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT),
+                 FDL_IMAGE_USAGE_SAMPLED) |
+            COND(image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT,
+                 FDL_IMAGE_USAGE_STORAGE) |
+            COND(image->vk.usage &
+                    (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                     VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+                     VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT |
+                     VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR),
+                 FDL_IMAGE_USAGE_ATTACHMENT),
          .plane = i,
       };
 
@@ -1762,4 +1798,3 @@ tu_bind_sparse_image(struct tu_device *device, void *submit,
                          prev_bo_offset, bind_range);
    }
 }
-
