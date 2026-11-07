@@ -2112,6 +2112,15 @@ ir3_supports_rpt(struct ir3_compiler *compiler, unsigned opc)
    case 3:
       return opc != OPC_DP2ACC && opc != OPC_DP4ACC;
    case 4:
+      /* Repeated SFU (category 4) instructions produce wrong results on
+       * a850v2 (chip 0x44051431, Droid-Deck/DroidDeck#980). The root cause
+       * is not known, so disable repeat for the whole category on this chip.
+       * Compare only the low 32 bits so that both the raw KGSL id and the
+       * 0xffff-prefixed form match.
+       */
+      if (compiler->dev_id &&
+          (compiler->dev_id->chip_id & UINT64_C(0xffffffff)) == 0x44051431)
+         return false;
       return opc != OPC_RCP;
    default:
       return false;
