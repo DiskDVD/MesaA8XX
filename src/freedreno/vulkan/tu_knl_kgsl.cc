@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #define __user
 #include "ion/ion.h"
@@ -190,7 +191,7 @@ bo_init_new_ion_legacy(struct tu_device *dev, struct tu_bo **out_bo, uint64_t si
 static VkResult
 kgsl_bo_user_map(struct tu_device *dev, struct tu_bo *bo, uint64_t client_iova)
 {
-   uint64_t offset = bo->gem_handle << 12;
+   uint64_t offset = static_cast<uint64_t>(bo->gem_handle) * getpagesize();
    /* KGSL may free the GPU VA of a destroyed BO asynchronously, and without MAP_FIXED_NOREPLACE,
     * it then silently places the BO elsewhere. With MAP_FIXED_NOREPLACE, KGSL flushes pending frees
     * and retries instead. Kernels older than 4.17 ignore the flag and treat client_iova as a hint.
@@ -471,7 +472,7 @@ kgsl_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
 {
    void *map = MAP_FAILED;
    if (bo->shared_fd == -1) {
-      uint64_t offset = bo->gem_handle << 12;
+      uint64_t offset = static_cast<uint64_t>(bo->gem_handle) * getpagesize();
       map = mmap(placed_addr, bo->size, PROT_READ | PROT_WRITE,
                  MAP_SHARED | (placed_addr != NULL ? MAP_FIXED : 0),
                  dev->physical_device->local_fd, offset);
@@ -2048,6 +2049,7 @@ tu_knl_kgsl_load(struct tu_instance *instance, int fd)
    case KGSL_UBWC_4_0:
    case KGSL_UBWC_5_0:
    case KGSL_UBWC_6_0:
+   case KGSL_UBWC_7_0:
       device->ubwc_config.bank_swizzle_levels = 0x6;
       device->ubwc_config.macrotile_mode = FDL_MACROTILE_8_CHANNEL;
       break;
