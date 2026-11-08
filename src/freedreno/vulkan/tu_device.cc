@@ -11,6 +11,7 @@
 
 #include "drm-uapi/drm_fourcc.h"
 #include "git_sha1.h"
+#include "tu_version.h"
 #include "perfcntrs/freedreno_perfcntr.h"
 
 #include "common/freedreno_stompable_regs.h"
