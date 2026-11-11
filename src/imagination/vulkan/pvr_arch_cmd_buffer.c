@@ -569,6 +569,7 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
    const uint32_t emit_count,
    const uint32_t *pbe_cs_words,
    const unsigned *tile_buffer_ids,
+   unsigned long *layer_size,
    unsigned pixel_output_width,
    struct pvr_pds_upload *const pds_upload_out)
 {
@@ -595,6 +596,9 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
 
    bool has_tile_buffers = false;
    for (unsigned u = 0; u < emit_count; ++u) {
+      props.rta_element_stride[u] =
+         layer_size[u] / ROGUE_PBESTATE_STATE_WORD0_ADDRESS_LOW_ALIGNMENT;
+
       unsigned tile_buffer_id = tile_buffer_ids[u];
       if (tile_buffer_id == ~0)
          continue;
@@ -1422,7 +1426,7 @@ pvr_sub_cmd_gfx_align_ds_subtiles(struct pvr_cmd_buffer *const cmd_buffer,
       .pNext = NULL,
       .bufferOffset = 0,
       .bufferRowLength = rounded_size.width,
-      .bufferImageHeight = 0,
+      .bufferImageHeight = rounded_size.height,
       .imageSubresource = {
          .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
          .mipLevel = ds->iview->vk.base_mip_level,
@@ -1452,6 +1456,7 @@ pvr_sub_cmd_gfx_align_ds_subtiles(struct pvr_cmd_buffer *const cmd_buffer,
       result = pvr_copy_image_to_buffer_region_format(cmd_buffer,
                                                       ds_image,
                                                       buffer->dev_addr,
+                                                      ds_image->alignment,
                                                       &region,
                                                       copy_format,
                                                       copy_format);
@@ -1485,6 +1490,7 @@ pvr_sub_cmd_gfx_align_ds_subtiles(struct pvr_cmd_buffer *const cmd_buffer,
 
       result = pvr_copy_buffer_to_image_region_format(cmd_buffer,
                                                       buffer->dev_addr,
+                                                      ds_image->alignment,
                                                       ds_image,
                                                       &region,
                                                       copy_format,
@@ -1509,6 +1515,7 @@ pvr_sub_cmd_gfx_align_ds_subtiles(struct pvr_cmd_buffer *const cmd_buffer,
    ds->addr = buffer->dev_addr;
    ds->base_array_layer = 0;
    ds->physical_extent = rounded_size;
+   ds->layer_size = buffer_layer_size;
 
    gfx_sub_cmd->wait_on_previous_transfer = true;
 
@@ -1523,6 +1530,8 @@ struct pvr_emit_state {
                          [ROGUE_NUM_PBESTATE_REG_WORDS];
 
    unsigned tile_buffer_ids[PVR_MAX_COLOR_ATTACHMENTS];
+
+   unsigned long layer_size[PVR_MAX_COLOR_ATTACHMENTS];
 
    uint32_t emit_count;
 };
@@ -1566,6 +1575,16 @@ pvr_setup_emit_state(const struct pvr_device_info *dev_info,
 
          if (mrt_resource->type != resource_type)
             continue;
+
+         const struct pvr_image *image = pvr_image_view_get_image(iview);
+
+         if (PVR_HAS_FEATURE(dev_info, gs_rta_support) &&
+             rstate->layers > 1 &&
+             image->memlayout != PVR_MEMLAYOUT_3DTWIDDLED) {
+            const struct pvr_image_plane *plane = pvr_single_plane_const(image);
+
+            emit_state->layer_size[emit_state->emit_count] = plane->layer_size;
+         }
 
          if (surface->need_resolve) {
             const struct pvr_image_view *resolve_src =
@@ -1705,6 +1724,7 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
             emit_state.emit_count,
             emit_state.pbe_cs_words[0],
             emit_state.tile_buffer_ids,
+            emit_state.layer_size,
             pixel_output_width,
             &pds_pixel_event_program);
          if (result != VK_SUCCESS)
@@ -4231,39 +4251,20 @@ void PVR_PER_ARCH(CmdBeginRenderPass2)(
                           &cmd_buffer->state.current_sub_cmd->gfx);
 }
 
-static inline uint32_t
-pvr_get_ds_component_bits(const VkFormat vk_format,
-                          const VkImageAspectFlags ds_aspect)
-{
-   uint32_t component;
-
-   if (ds_aspect == VK_IMAGE_ASPECT_STENCIL_BIT) {
-      assert(vk_format_has_stencil(vk_format));
-      component = 0;
-   } else {
-      assert(ds_aspect == VK_IMAGE_ASPECT_DEPTH_BIT);
-      assert(vk_format_has_depth(vk_format));
-      component = 1;
-   }
-
-   return vk_format_get_component_bits(vk_format,
-                                       UTIL_FORMAT_COLORSPACE_ZS,
-                                       component);
-}
-
 static inline bool
-pvr_can_pbe_resolve_ds_attachment(const struct pvr_device_info *dev_info,
-                                  VkFormat vk_format,
-                                  uint32_t sample_count,
-                                  VkResolveModeFlagBits resolve_mode)
+pvr_can_pbe_resolve_attachment(const struct pvr_device_info *dev_info,
+                               VkFormat vk_format,
+                               VkResolveModeFlagBits resolve_mode)
 {
+   /* On cores without gs_rta_support, PBE resolves might depend on writes
+    * that occur within the deferred RTA clears that happen after the PBE has
+    * written. Since the driver doesn't know at CmdBeginRendering whether
+    * RTA clears are needed, PBE resolves can't be used.
+    */
    if (!PVR_HAS_FEATURE(dev_info, gs_rta_support))
       return false;
 
    if (resolve_mode != VK_RESOLVE_MODE_AVERAGE_BIT)
-      return false;
-
-   if (pvr_get_ds_component_bits(vk_format, VK_IMAGE_ASPECT_STENCIL_BIT))
       return false;
 
    return pvr_arch_format_is_pbe_downscalable(dev_info, vk_format);
@@ -4368,10 +4369,9 @@ static VkResult pvr_dynamic_rendering_output_attachments_setup(
       attachment->stencil_resolve_mode = VK_RESOLVE_MODE_NONE;
       attachment->need_eot = true;
       /* TODO: verify logic for is_pbe_downscalable */
-      attachment->is_pbe_downscalable = pvr_can_pbe_resolve_ds_attachment(
+      attachment->is_pbe_downscalable = pvr_can_pbe_resolve_attachment(
          &cmd_buffer->device->pdevice->dev_info,
          iview->vk.view_format,
-         image->vk.samples,
          attachment_info->resolveMode);
 
       dr_info->color_attachments[i].index_color = cur_attach_idx;

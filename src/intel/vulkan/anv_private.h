@@ -209,6 +209,23 @@ align_down_npot_u64(uint64_t v, uint64_t a)
    return v - (v % a);
 }
 
+/*
+ * The DRIRC value anv_force_preferred_walk_order is an
+ * enum intel_compute_walk_order value + 1, so that 0 can mean "not set,
+ * use the compiled walk order".
+ *
+ * Returns the default walk_order when the DRIRC value is 0 (not set).
+ */
+static inline enum intel_compute_walk_order
+anv_compute_walk_order(unsigned force_preferred_walk_order, enum intel_compute_walk_order walk_order)
+{
+   if (force_preferred_walk_order == 0)
+      return walk_order;
+
+   assert(force_preferred_walk_order <= INTEL_WALK_ORDER_ZYX + 1);
+   return (enum intel_compute_walk_order)(force_preferred_walk_order - 1);
+}
+
 static inline union isl_color_value
 vk_to_isl_color(VkClearColorValue color)
 {
@@ -3199,6 +3216,7 @@ void anv_wait_for_attach(void);
 VkResult anv_queue_init(struct anv_device *device, struct anv_queue *queue,
                         const VkDeviceQueueCreateInfo *pCreateInfo,
                         uint32_t index_in_family);
+void anv_queue_drain(struct anv_queue *queue);
 void anv_queue_finish(struct anv_queue *queue);
 
 VkResult anv_queue_submit(struct vk_queue *queue,
@@ -4785,6 +4803,20 @@ struct anv_cmd_state {
    VkPipelineStageFlags2                        pending_src_stages;
    VkPipelineStageFlags2                        pending_dst_stages;
    enum anv_pipe_bits                           pending_pipe_bits;
+
+   /**
+    * Tracks whether constant cache invalidation for the fragment shader stage
+    * has been delayed.
+    *
+    * Pushed UBO ranges (3DSTATE_CONSTANT_* buffer pointers) are fetched by
+    * the front end of the pipeline, ahead of the raster/pixel stages. To
+    * avoid a barrier with the TOP waiting stages that costs us some
+    * performance, we delay the push constant invalidation for the fragment
+    * stage until we detect a fragment shader with a push range other then
+    * push constants data.
+    */
+   bool                                         deferred_constant_cache_inval;
+   unsigned                                     deferred_constant_cache_stage;
 
    /**
     * Whether the last programmed STATE_BASE_ADDRESS references

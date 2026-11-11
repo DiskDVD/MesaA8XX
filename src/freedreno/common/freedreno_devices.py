@@ -68,9 +68,15 @@ add_gpus([
         reg_size_vec4 = 48, # not measured the way a5xx was
     ))
 
+# FIXME: measure on the hardware
 add_gpus([
         GPUId(505),
         GPUId(506),
+    ], A5xxGPUInfo(num_sp_cores = 1, highest_bank_bit = 14,
+                   reg_size_vec4 = 64,
+                   wave_granularity = 1))
+
+add_gpus([
         GPUId(508),
         GPUId(509),
     ], GPUInfo(
@@ -89,8 +95,15 @@ add_gpus([
         reg_size_vec4 = 64,
     ))
 
+# FIXME: measure on the hardware
 add_gpus([
         GPUId(510),
+    ], A5xxGPUInfo(num_sp_cores = 2, highest_bank_bit = 14,
+                   reg_size_vec4 = 64,
+                   wave_granularity = 1))
+
+add_gpus([
+        GPUId(509),
         GPUId(512),
     ], GPUInfo(
         CHIP.A5XX,
@@ -110,6 +123,11 @@ add_gpus([
 
 add_gpus([
         GPUId(530),
+    ], A5xxGPUInfo(num_sp_cores = 4, highest_bank_bit = 15,
+                   reg_size_vec4 = 64,
+                   wave_granularity = 2))
+
+add_gpus([
         GPUId(540),
     ], GPUInfo(
         CHIP.A5XX,
@@ -850,6 +868,8 @@ a7xx_gen2 = GPUProps(
         QCTDD08049535 = True,
         QCTDD08901551 = True,
         QCTDD08517960 = True,
+        # TODO we might need to check if fw supports the w/a:
+        # QCTDD10497382 = True,
     )
 
 a7xx_gen3 = GPUProps(
@@ -871,7 +891,6 @@ a7xx_gen3 = GPUProps(
         has_primitive_shading_rate = True,
         has_ray_intersection = True,
         has_sw_fuse = True,
-        has_rt_workaround = True,
         has_alias_rt = True,
         has_abs_bin_mask = True,
         new_control_regs = True,
@@ -883,6 +902,7 @@ a7xx_gen3 = GPUProps(
         subpass_fence_cleans_resolve = True,
 
         QCTDD08901551 = False,
+        QCTDD10497382 = True,
         QCTDD12766770 = True,
         QCTDD13523866 = True,
     )
@@ -944,7 +964,7 @@ a740_raw_magic_regs = [
         [A6XXRegs.REG_A7XX_UCHE_UNKNOWN_0E10, 0x00000000],
         [A6XXRegs.REG_A7XX_UCHE_UNKNOWN_0E11, 0x00000000],
         [A6XXRegs.REG_A7XX_SP_HLSQ_DBG_ECO_CNTL, 0x00000000],
-        [A6XXRegs.REG_A6XX_SP_DBG_ECO_CNTL, 0x10000000],
+        [A6XXRegs.REG_A6XX_SP_DBG_ECO_CNTL, 0x10200000],
         [A6XXRegs.REG_A6XX_PC_MODE_CNTL,    0x1f1f],
         [A6XXRegs.REG_A6XX_PC_DBG_ECO_CNTL, 0x00100000],
         [A6XXRegs.REG_A7XX_PC_UNKNOWN_9E24, 0x21585600],
@@ -1321,6 +1341,7 @@ a8xx_base = GPUProps(
         max_storage_buffer_range_bytes = (1 << 31) - 1,
 
         QCTDD10204462 = False,
+        QCTDD10497382 = False,
         QCTDD11147232 = False,
     )
 
