@@ -1754,6 +1754,9 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
    };
    VkPipelineCreationFeedback stage_feedbacks[MESA_SHADER_STAGES] = { 0 };
 
+  /* Per-layer FDM and sample-rate shading are disabled on every A7XX and newer GPU (A7XX..A8XX), selected by generation rather than by chip_id.
+    */
+   const bool is_target_gpu = builder->device->physical_device->info->chip >= 7;
    const bool executable_info =
       builder->create_flags &
       VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
@@ -1914,7 +1917,8 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
          }
       }
 
-      keys[last_pre_rast_stage].fdm_per_layer = builder->fdm_per_layer;
+      keys[last_pre_rast_stage].fdm_per_layer =
+         is_target_gpu ? false : builder->fdm_per_layer;
    }
 
    if (builder->state & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) {
@@ -1956,7 +1960,7 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
        * tu_shader_key::force_sample_interp in a bit.
        */
       keys[MESA_SHADER_FRAGMENT].force_sample_interp =
-         !builder->rasterizer_discard && msaa_info && msaa_info->sampleShadingEnable;
+         is_target_gpu ? false : (!builder->rasterizer_discard && msaa_info && msaa_info->sampleShadingEnable);
    }
 
    unsigned char pipeline_blake3[BLAKE3_KEY_LEN];
