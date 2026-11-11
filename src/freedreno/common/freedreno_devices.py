@@ -1333,7 +1333,6 @@ add_gpus([
 a8xx_base = GPUProps(
         has_dp2acc = False,
         reg_size_vec4 = 96,
-        has_rt_workaround = False,
         supports_double_threadsize = True,
         has_dual_wave_dispatch = True,
         round_robin_errata = False,
