@@ -1,13 +1,15 @@
 /*
- * Copyright © 2015 Rob Clark <robclark@freedesktop.org>
+ * Copyright © 2015 Rob Clark <robclark@freedreno.org>
  * SPDX-License-Identifier: MIT
  *
  * Authors:
- *    Rob Clark <robclark@freedesktop.org>
+ *    Rob Clark <robclark@freedreno.org>
  */
 
 #include "util/u_call_once.h"
 #include "util/ralloc.h"
+#include "util/u_debug.h"
+#include "util/macros.h"
 
 #include "freedreno_dev_info.h"
 
@@ -57,32 +59,58 @@ DEBUG_GET_ONCE_OPTION(ir3_shader_override_path, "IR3_SHADER_OVERRIDE_PATH",
 enum ir3_shader_debug ir3_shader_debug = 0;
 const char *ir3_shader_override_path = NULL;
 
+/* KGSL/DRM may report the chip id with a speedbin fused into the upper bits
+ * (e.g. 0xffff44010000 for A810, while the "raw" id is 0x44010000).
+ * Normalize before doing any chip-specific comparison, otherwise the
+ * A8xx-specific code silently never triggers on device.
+ */
+static inline uint32_t
+ir3_chip_id(const struct fd_dev_id *dev_id)
+{
+   return (uint32_t)(dev_id->chip_id & 0xffffffffu);
+}
+
+/* NOTE: first field is reg_efficiency (percent of the register file).
+ *
+ * It used to be 70..90, which permanently threw away 10-30% of the register
+ * file and caused spills/private-memory traffic. On a bandwidth-limited part
+ * like A810 that is a pure loss, so use the full file (100) everywhere.
+ * IR3_REG_SCALE=<50..100> can still force a smaller percentage for A/B.
+ */
 struct ir3_gpu_profile
 ir3_get_gpu_profile(uint32_t chip_id)
 {
     switch (chip_id) {
     case 0x44010000: /* Adreno 810 */
-        return (struct ir3_gpu_profile){90, 4, 4, false, 128};
+        return (struct ir3_gpu_profile){100, 4, 4, false, 128};
     case 0x44030000: /* Adreno 825 */
-        return (struct ir3_gpu_profile){85, 8, 8, false, 0};
+        return (struct ir3_gpu_profile){100, 8, 8, false, 0};
     case 0x44030A20: /* Adreno 829 */
-        return (struct ir3_gpu_profile){80, 10, 8, true, 64};
+        return (struct ir3_gpu_profile){100, 10, 8, true, 64};
     case 0x44050001: /* Adreno 830 */
-        return (struct ir3_gpu_profile){75, 16, 12, false, 0};
+        return (struct ir3_gpu_profile){100, 16, 12, false, 0};
     case 0x43050A31: /* Adreno 830 variant */
-        return (struct ir3_gpu_profile){75, 16, 12, false, 0};
+        return (struct ir3_gpu_profile){100, 16, 12, false, 0};
     case 0x43050A32: /* Adreno 840 */
-        return (struct ir3_gpu_profile){70, 20, 16, false, 0};
+        return (struct ir3_gpu_profile){100, 20, 16, false, 0};
     default:
-        return (struct ir3_gpu_profile){85, 8, 8, false, 0};
+        return (struct ir3_gpu_profile){100, 8, 8, false, 0};
     }
 }
 
 uint32_t
 ir3_effective_reg_size(struct ir3_compiler *compiler)
 {
-    struct ir3_gpu_profile profile = ir3_get_gpu_profile(compiler->dev_id->chip_id);
-    return compiler->reg_size_vec4 * profile.reg_efficiency / 100;
+    /* A/B knob: 0/unset = use the profile value (100 = full register file). */
+    static const int scale = debug_get_num_option("IR3_REG_SCALE", 0);
+
+    struct ir3_gpu_profile profile =
+       ir3_get_gpu_profile(ir3_chip_id(compiler->dev_id));
+
+    unsigned pct = scale ? (unsigned)CLAMP(scale, 50, 100)
+                         : profile.reg_efficiency;
+
+    return compiler->reg_size_vec4 * pct / 100;
 }
 
 void
@@ -127,12 +155,12 @@ ir3_nir_lower_convert_alu_types(nir_intrinsic_instr *conv)
        (dest_bit_size > src_bit_size))
       return true;
 
-   /* int64 needs nir_lower_int64, as hw does not natively support this: */
+   /* int64 needs nir_lower_int64, as hw doesn't natively support this: */
    if ((dest_bit_size > 32) || (src_bit_size > 32))
       return true;
 
-   /* Conversions [u]int8 <-> float need some special handling, but we
-    * can just let the lowering and normal create_cov() path handle it:
+   /* Conversions [u]int8 <-> float need some special handling, but we want
+    * the lowering and normal create_cov() path handle them.
     */
    if ((dest_bit_size < 16) || (src_bit_size < 16))
       return true;
@@ -225,7 +253,6 @@ static const nir_shader_compiler_options ir3_base_options = {
    .has_global_offset = true,
 };
 
-
 static void
 __debug_init(void)
 {
@@ -233,9 +260,8 @@ __debug_init(void)
    ir3_shader_override_path =
       __normal_user() ? debug_get_option_ir3_shader_override_path() : NULL;
 
-   if (ir3_shader_override_path) {
+   if (ir3_shader_override_path)
       ir3_shader_debug |= IR3_DBG_NOCACHE;
-   }
 
    ir3_shader_bisect_init();
 }
@@ -250,7 +276,7 @@ ir3_compiler_debug_init(void)
 static inline bool
 ir3_is_a810(const struct fd_dev_id *dev_id)
 {
-   return dev_id->chip_id == 0x44010000;
+   return ir3_chip_id(dev_id) == 0x44010000;
 }
 
 struct ir3_compiler *
@@ -269,7 +295,11 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
    compiler->options = *options;
    compiler->info = dev_info;
 
-   if (ir3_is_a810(dev_id))
+   /* Disabling descriptor prefetch is a workaround, not an optimization:
+    * keep it opt-in so the fast path stays the default.
+    */
+   if (ir3_is_a810(dev_id) &&
+       debug_get_bool_option("IR3_A810_NODESCPREFETCH", false))
       ir3_shader_debug |= IR3_DBG_NODESCPREFETCH;
 
    /* TODO see if older GPU's were different here */
@@ -352,7 +382,18 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
 
       compiler->has_alias_tex = (compiler->gen >= 7);
 
-      if (compiler->gen == 7) {
+      /* a8xx shares the a7xx ISA timing, but gen == 7 used to exclude it, so
+       * A8xx kept the longer a6xx-like slots (3/6/2) and padded every
+       * dependent ALU chain with an extra NOP.
+       *
+       * Opt-in for now: IR3_A8XX_FAST_DELAYS=1 selects 2/5/1 on gen8 too.
+       * Make it the default only after CTS + a heavy scene are clean.
+       */
+      const bool a8xx_fast_delays =
+         compiler->gen >= 8 &&
+         debug_get_bool_option("IR3_A8XX_FAST_DELAYS", false);
+
+      if (compiler->gen == 7 || a8xx_fast_delays) {
          compiler->delay_slots.alu_to_alu = 2;
          compiler->delay_slots.non_alu = 5;
          compiler->delay_slots.cat3_src2_read = 1;
@@ -369,7 +410,6 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
       if (compiler->gen == 5) {
          compiler->max_const_geom = 448;
          compiler->max_const_frag = 448;
-         compiler->max_const_compute = 448;
       }
 
       /* Note: this will have to change if/when we support tess+GS on
@@ -426,7 +466,7 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
     * to profitably merge short gaps in promoted ranges.
     */
    compiler->ubo_push_coalesce_gap =
-      ir3_get_gpu_profile(dev_id->chip_id).ubo_coalesce_gap;
+      ir3_get_gpu_profile(ir3_chip_id(dev_id)).ubo_coalesce_gap;
 
    /* The driver can't request this unless preambles are supported. */
    if (options->push_ubo_with_preamble)
@@ -494,21 +534,21 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
    compiler->nir_options.support_indirect_outputs = (uint8_t)BITFIELD_MASK(MESA_SHADER_STAGES);
    compiler->nir_options.max_offset_shift = ir3_nir_max_offset_shift;
    compiler->nir_options.cb_data = compiler;
-
+   
    if (!options->disable_cache)
+      
       ir3_disk_cache_init(compiler);
-
+   
    return compiler;
 }
-
 const nir_shader_compiler_options *
 ir3_get_compiler_options(struct ir3_compiler *compiler)
-{
+{   
    return &compiler->nir_options;
-}
 
+}
 const char *
 ir3_shader_debug_as_string()
-{
+{   
    return debug_dump_flags(shader_debug_options, ir3_shader_debug);
 }
